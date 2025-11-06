@@ -9,7 +9,7 @@ The main coordinator that:
 5. Sends decisions to execution agents
 """
 import anthropic
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
 from sqlalchemy import text
 import json
@@ -17,7 +17,9 @@ import json
 from agents.base_agent import BaseAgent, AgentType, SignalType
 from agents.data_collectors.price_collector import PriceCollectorAgent
 from agents.analysts.technical_analyst import TechnicalAnalystAgent
+from agents.analysts.sentiment_analyst import SentimentAnalystAgent
 from config.config import config
+from trading.paper_trading_engine import PaperTradingEngine, OrderType, OrderSide, PositionSide
 
 
 class OrchestratorAgent(BaseAgent):
@@ -33,7 +35,7 @@ class OrchestratorAgent(BaseAgent):
     - Monitor system health
     """
 
-    def __init__(self):
+    def __init__(self, enable_sentiment: bool = True):
         super().__init__(
             agent_name="Orchestrator",
             agent_type=AgentType.ORCHESTRATOR,
@@ -44,10 +46,33 @@ class OrchestratorAgent(BaseAgent):
         self.price_collector = PriceCollectorAgent()
         self.technical_analyst = TechnicalAnalystAgent()
 
+        # Initialize sentiment analyst (optional - may not have API keys)
+        self.sentiment_analyst = None
+        if enable_sentiment:
+            try:
+                self.sentiment_analyst = SentimentAnalystAgent()
+                self.logger.info("Sentiment analyst enabled")
+            except Exception as e:
+                self.logger.warning(f"Sentiment analyst disabled: {e}")
+
         # Initialize Claude AI client
         self.claude = anthropic.Anthropic(api_key=config.anthropic_api_key)
 
-        self.logger.info("Orchestrator initialized with sub-agents")
+        # Initialize paper trading engine for portfolio snapshots
+        self.paper_trading_engine = PaperTradingEngine(
+            initial_capital=config.initial_capital,
+            db=self.db
+        )
+
+        active_analysts = ["technical"]
+        if self.sentiment_analyst:
+            active_analysts.append("sentiment")
+
+        # Cache for optimized weights (refreshed periodically)
+        self.optimized_weights = None
+        self.weights_last_loaded = None
+
+        self.logger.info(f"Orchestrator initialized with analysts: {', '.join(active_analysts)}")
 
     def run(self) -> Dict[str, Any]:
         """
@@ -57,7 +82,7 @@ class OrchestratorAgent(BaseAgent):
             Dict with execution results
         """
         results = {
-            'cycle_start': datetime.now().isoformat(),
+            'cycle_start': datetime.now(timezone.utc).isoformat(),
             'steps_completed': [],
             'trading_decisions': [],
             'errors': []
@@ -101,6 +126,30 @@ class OrchestratorAgent(BaseAgent):
             self.logger.error(error_msg, exc_info=True)
             results['errors'].append(error_msg)
 
+        # Step 2b: Run sentiment analysis (if enabled)
+        if self.sentiment_analyst:
+            self.logger.info("Step 2b: Running sentiment analysis...")
+            try:
+                sentiment_result = self.sentiment_analyst.execute()
+                results['steps_completed'].append('sentiment_analysis')
+                results['sentiment_analysis'] = {
+                    'success': sentiment_result['success'],
+                    'symbols_analyzed': sentiment_result.get('symbols_analyzed', 0),
+                    'signals_generated': sentiment_result.get('signals_generated', 0),
+                    'bullish_signals': sentiment_result.get('bullish_signals', 0),
+                    'bearish_signals': sentiment_result.get('bearish_signals', 0)
+                }
+                self.logger.info(
+                    f"Sentiment analysis: {sentiment_result.get('symbols_analyzed', 0)} symbols, "
+                    f"{sentiment_result.get('signals_generated', 0)} signals "
+                    f"({sentiment_result.get('bullish_signals', 0)} bullish, "
+                    f"{sentiment_result.get('bearish_signals', 0)} bearish)"
+                )
+            except Exception as e:
+                error_msg = f"Sentiment analysis failed: {e}"
+                self.logger.error(error_msg, exc_info=True)
+                results['errors'].append(error_msg)
+
         # Step 3: Make trading decisions
         self.logger.info("Step 3: Making trading decisions...")
         try:
@@ -110,6 +159,17 @@ class OrchestratorAgent(BaseAgent):
             self.logger.info(f"Made {len(decisions)} trading decisions")
         except Exception as e:
             error_msg = f"Trading decisions failed: {e}"
+            self.logger.error(error_msg, exc_info=True)
+            results['errors'].append(error_msg)
+
+        # Step 3b: Save portfolio snapshot
+        self.logger.info("Step 3b: Saving portfolio snapshot...")
+        try:
+            self.paper_trading_engine.save_portfolio_snapshot()
+            results['steps_completed'].append('portfolio_snapshot')
+            self.logger.info("Portfolio snapshot saved")
+        except Exception as e:
+            error_msg = f"Portfolio snapshot failed: {e}"
             self.logger.error(error_msg, exc_info=True)
             results['errors'].append(error_msg)
 
@@ -124,7 +184,7 @@ class OrchestratorAgent(BaseAgent):
             self.logger.error(error_msg, exc_info=True)
             results['errors'].append(error_msg)
 
-        results['cycle_end'] = datetime.now().isoformat()
+        results['cycle_end'] = datetime.now(timezone.utc).isoformat()
         results['success'] = len(results['errors']) == 0
 
         return results
@@ -176,7 +236,13 @@ class OrchestratorAgent(BaseAgent):
                     decisions.append(decision)
 
                     # Log decision
-                    self._log_decision(decision)
+                    decision_id = self._log_decision(decision)
+
+                    # Execute trading decisions
+                    if decision['decision'] == 'BUY' and decision_id:
+                        self._execute_buy_decision(decision, decision_id)
+                    elif decision['decision'] == 'SELL' and decision_id:
+                        self._execute_sell_decision(decision, decision_id)
 
             except Exception as e:
                 self.logger.error(f"Error making decision for {symbol}: {e}", exc_info=True)
@@ -185,18 +251,35 @@ class OrchestratorAgent(BaseAgent):
 
     def _get_recent_signals(self, symbol: str, hours: int = 1) -> List[Dict[str, Any]]:
         """
-        Get recent signals for a symbol
+        Get recent signals for a symbol from all agents
 
         Args:
-            symbol: Trading pair symbol
+            symbol: Trading pair symbol (e.g., 'BTC/USDT' or 'BTC')
             hours: Number of hours to look back
 
         Returns:
-            List of signal dicts
+            List of signal dicts, grouped by agent (most recent from each)
         """
         try:
+            # Handle both 'BTC/USDT' and 'BTC' formats
+            symbol_base = symbol.split('/')[0] if '/' in symbol else symbol
+
             with self.db.get_session() as session:
+                # Get most recent signal from each agent within the time window
                 query = text("""
+                    WITH ranked_signals AS (
+                        SELECT
+                            agent_name,
+                            signal,
+                            confidence,
+                            reasoning,
+                            metadata,
+                            time,
+                            ROW_NUMBER() OVER (PARTITION BY agent_name ORDER BY time DESC) as rn
+                        FROM agent_signals
+                        WHERE (symbol = :symbol OR symbol = :symbol_base)
+                            AND time >= NOW() - INTERVAL '1 hour' * :hours
+                    )
                     SELECT
                         agent_name,
                         signal,
@@ -204,14 +287,14 @@ class OrchestratorAgent(BaseAgent):
                         reasoning,
                         metadata,
                         time
-                    FROM agent_signals
-                    WHERE symbol = :symbol
-                        AND time >= NOW() - INTERVAL ':hours hours'
+                    FROM ranked_signals
+                    WHERE rn = 1
                     ORDER BY time DESC
                 """)
 
                 results = session.execute(query, {
                     'symbol': symbol,
+                    'symbol_base': symbol_base,
                     'hours': hours
                 }).fetchall()
 
@@ -298,51 +381,121 @@ class OrchestratorAgent(BaseAgent):
         market_data: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         """
-        Make trading decision based on analyst signals (without Claude AI)
+        Make trading decision using multi-agent consensus
+
+        Aggregates signals from multiple analysts with weighted voting:
+        - Technical Analyst: 40% weight (for crypto)
+        - Sentiment Analyst: 60% weight (for crypto - community-driven markets)
 
         Args:
             symbol: Trading pair symbol
-            signals: List of signals from analysts
+            signals: List of signals from analysts (one per agent)
             market_data: Current market context
 
         Returns:
-            Trading decision dict or None
+            Trading decision dict with combined reasoning
         """
         if not signals:
             return None
 
-        # Get the most recent signal (they're ordered by time DESC)
-        latest_signal = signals[0]
+        # Group signals by agent
+        agent_signals = {}
+        for sig in signals:
+            agent_name = sig['agent_name']
+            agent_signals[agent_name] = sig
 
-        signal_type = latest_signal['signal'].upper()
-        confidence = latest_signal['confidence']
+        # Load optimized weights from Weight Optimizer
+        # Falls back to static weights if optimization not available
+        weights = self._get_agent_weights(symbol)
 
-        # Only make BUY/SELL decisions if confidence is high enough
-        if signal_type == 'BUY' and confidence >= 0.7:
+        # Convert signals to scores and calculate weighted average
+        signal_scores = []
+        confidence_scores = []
+        total_weight = 0
+
+        for agent_name, sig in agent_signals.items():
+            # Get weight for this agent (default 0.5 if not defined)
+            weight = weights.get(agent_name, 0.5)
+
+            # Convert signal to score (-100 to +100)
+            signal_type = sig['signal'].upper()
+            if signal_type == 'BUY':
+                score = 100
+            elif signal_type == 'SELL':
+                score = -100
+            else:  # HOLD
+                score = 0
+
+            # Check if metadata has a strength score
+            if sig.get('metadata') and isinstance(sig['metadata'], dict):
+                strength = sig['metadata'].get('strength')
+                if strength is not None:
+                    score = float(strength)  # Use the actual strength score
+
+            # Apply weight
+            weighted_score = score * weight
+            signal_scores.append(weighted_score)
+
+            # Apply weight to confidence
+            confidence_scores.append(sig['confidence'] * weight)
+            total_weight += weight
+
+        # Calculate final aggregated score and confidence
+        final_score = sum(signal_scores) / max(total_weight, 1)
+        final_confidence = sum(confidence_scores) / max(total_weight, 1)
+
+        # Determine decision based on final score
+        if final_score > 50:
             decision = 'BUY'
-            position_size_pct = min(confidence * 0.3, 0.3)  # Max 30% of capital
+            position_size_pct = min(final_confidence * 0.3, 0.3)  # Max 30%
             stop_loss_pct = 0.05  # 5% stop loss
-        elif signal_type == 'SELL' and confidence >= 0.7:
+        elif final_score < -50:
             decision = 'SELL'
-            position_size_pct = 0
-            stop_loss_pct = 0
+            position_size_pct = min(final_confidence * 0.3, 0.3)  # Max 30% for SHORT positions
+            stop_loss_pct = 0.05  # 5% stop loss for SHORT
         else:
             decision = 'HOLD'
             position_size_pct = 0
             stop_loss_pct = 0
 
-        reasoning = f"Based on {latest_signal['agent_name']} signal: {latest_signal['reasoning']}"
+        # Build multi-agent reasoning
+        if len(agent_signals) > 1:
+            reasoning_parts = [f"Multi-agent consensus ({len(agent_signals)} agents):"]
+
+            for agent_name, sig in agent_signals.items():
+                weight = weights.get(agent_name, 0.5)
+                weight_pct = int(weight * 100)
+
+                # Extract score from metadata if available
+                score_str = ""
+                if sig.get('metadata') and isinstance(sig['metadata'], dict):
+                    strength = sig['metadata'].get('strength')
+                    if strength is not None:
+                        score_str = f"Score {strength}/100, "
+
+                reasoning_parts.append(
+                    f"- {agent_name} ({weight_pct}% weight): {score_str}{sig['signal'].upper()}"
+                )
+                reasoning_parts.append(f"  {sig['reasoning']}")
+
+            reasoning_parts.append(f"\nFinal: {int(final_score)}/100 - {decision} decision")
+            reasoning = "\n".join(reasoning_parts)
+        else:
+            # Single agent fallback
+            single_sig = list(agent_signals.values())[0]
+            reasoning = f"Based on {single_sig['agent_name']} signal: {single_sig['reasoning']}"
 
         return {
             'symbol': symbol,
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'decision': decision,
-            'confidence': confidence,
+            'confidence': final_confidence,
             'reasoning': reasoning,
             'position_size_pct': position_size_pct,
             'stop_loss_pct': stop_loss_pct,
             'current_price': market_data.get('current_price'),
             'signals_considered': len(signals),
+            'final_score': int(final_score),
             'trading_mode': config.trading_mode
         }
 
@@ -478,7 +631,7 @@ STOP_LOSS: [0-100]%
         """
         decision = {
             'symbol': symbol,
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'decision': 'HOLD',
             'confidence': 0.5,
             'reasoning': response,
@@ -519,12 +672,92 @@ STOP_LOSS: [0-100]%
 
         return decision
 
-    def _log_decision(self, decision: Dict[str, Any]):
+    def _get_agent_weights(self, symbol: str) -> Dict[str, float]:
+        """
+        Get optimized agent weights from Weight Optimizer
+
+        Falls back to static weights if optimization not available
+
+        Args:
+            symbol: Trading pair symbol
+
+        Returns:
+            Dict of {agent_name: weight}
+        """
+        from datetime import datetime, timezone, timedelta
+
+        # Refresh weights every hour
+        should_refresh = (
+            self.weights_last_loaded is None or
+            (datetime.now(timezone.utc) - self.weights_last_loaded).total_seconds() > 3600
+        )
+
+        if should_refresh:
+            try:
+                # Try to load from Redis cache first (fastest)
+                cached_weights = self.redis.get_json('agent_weights:current')
+
+                if cached_weights:
+                    self.optimized_weights = cached_weights
+                    self.weights_last_loaded = datetime.now(timezone.utc)
+                    self.logger.info(f"Loaded optimized weights from cache: {cached_weights}")
+                else:
+                    # Load from database
+                    with self.db.get_session() as session:
+                        query = text("""
+                            SELECT agent_weights
+                            FROM weight_history
+                            ORDER BY timestamp DESC
+                            LIMIT 1
+                        """)
+
+                        result = session.execute(query).fetchone()
+
+                        if result and result[0]:
+                            self.optimized_weights = result[0]  # JSONB field
+                            self.weights_last_loaded = datetime.now(timezone.utc)
+                            self.logger.info(f"Loaded optimized weights from DB: {self.optimized_weights}")
+                        else:
+                            self.logger.info("No optimized weights found, using static weights")
+                            self.optimized_weights = None
+
+            except Exception as e:
+                self.logger.warning(f"Could not load optimized weights: {e}")
+                self.optimized_weights = None
+
+        # Use optimized weights if available
+        if self.optimized_weights:
+            return self.optimized_weights
+
+        # Fallback to static weights based on asset class
+        is_crypto = any(crypto in symbol for crypto in ['BTC', 'ETH', 'SOL', 'AVAX', 'MATIC'])
+
+        if is_crypto:
+            weights = {
+                'TechnicalAnalyst': 0.4,
+                'SentimentAnalyst': 0.6,
+                'OnChainAnalyst': 0.5,  # If added later
+                'NewsAnalyst': 0.3      # If added later
+            }
+        else:
+            weights = {
+                'TechnicalAnalyst': 0.5,
+                'SentimentAnalyst': 0.3,
+                'FundamentalAnalyst': 0.4,  # If added later
+                'NewsAnalyst': 0.2           # If added later
+            }
+
+        return weights
+
+    def _log_decision(self, decision: Dict[str, Any]) -> Optional[int]:
         """
         Log trading decision to database
 
         Args:
             decision: Trading decision dict
+
+        Returns:
+            decision_id if successful, None otherwise
         """
         try:
             with self.db.get_session() as session:
@@ -551,17 +784,168 @@ STOP_LOSS: [0-100]%
                         :signals_considered,
                         :trading_mode,
                         :timestamp
-                    )
+                    ) RETURNING id
                 """)
 
-                session.execute(query, decision)
+                result = session.execute(query, decision)
+                decision_id = result.fetchone()[0]
                 session.commit()
 
                 self.logger.info(f"Logged decision: {decision['decision']} {decision['symbol']}")
+                return decision_id
 
         except Exception as e:
             # Create table if it doesn't exist
             self.logger.warning(f"Could not log decision (table may not exist): {e}")
+            return None
+
+    def _execute_buy_decision(self, decision: Dict[str, Any], decision_id: int):
+        """
+        Execute a BUY decision by placing an order
+
+        Args:
+            decision: The trading decision dict
+            decision_id: The decision_id from the database
+        """
+        try:
+            symbol = decision['symbol']
+            current_price = decision['current_price']
+            position_size_pct = decision.get('position_size_pct', 0)
+
+            if not current_price or position_size_pct <= 0:
+                self.logger.info(f"Skipping execution - price or position size not set for {symbol}")
+                return
+
+            # Get current portfolio value
+            portfolio_value = self.paper_trading_engine.get_portfolio_value()
+            available_capital = portfolio_value.cash_balance
+
+            # Calculate order value and quantity
+            order_value = available_capital * position_size_pct
+            quantity = order_value / current_price
+
+            # Determine asset class (all current symbols are crypto)
+            asset_class = 'crypto'
+
+            self.logger.info(
+                f"Executing BUY for {symbol}: "
+                f"{quantity:.8f} @ ${current_price:.2f} = ${order_value:.2f} "
+                f"({position_size_pct*100:.1f}% of portfolio)"
+            )
+
+            # Execute the order
+            order = self.paper_trading_engine.execute_order(
+                symbol=symbol,
+                asset_class=asset_class,
+                order_type=OrderType.MARKET,
+                side=OrderSide.BUY,
+                quantity=quantity,
+                decision_id=decision_id
+            )
+
+            if order:
+                self.logger.info(f"✅ Order executed: {order.order_id} - {quantity:.8f} {symbol}")
+            else:
+                self.logger.warning(f"❌ Order execution failed for {symbol}")
+
+        except Exception as e:
+            self.logger.error(f"Error executing BUY decision for {decision.get('symbol')}: {e}", exc_info=True)
+
+    def _execute_sell_decision(self, decision: Dict[str, Any], decision_id: int):
+        """
+        Execute a SELL decision - either close existing LONG position or open SHORT position
+
+        Args:
+            decision: The trading decision dict
+            decision_id: The decision_id from the database
+        """
+        try:
+            symbol = decision['symbol']
+            current_price = decision['current_price']
+            position_size_pct = decision.get('position_size_pct', 0)
+
+            if not current_price:
+                self.logger.info(f"Skipping execution - price not available for {symbol}")
+                return
+
+            # Check if we have an existing LONG position to close
+            existing_position = None
+            with self.db.get_session() as session:
+                result = session.execute(text("""
+                    SELECT position_id, quantity, entry_price, side
+                    FROM paper_positions
+                    WHERE symbol = :symbol
+                    LIMIT 1
+                """), {'symbol': symbol}).fetchone()
+
+                if result:
+                    existing_position = {
+                        'position_id': result[0],
+                        'quantity': float(result[1]),
+                        'entry_price': float(result[2]),
+                        'side': result[3]
+                    }
+
+            # Determine asset class (all current symbols are crypto)
+            asset_class = 'crypto'
+
+            if existing_position and existing_position['side'] == 'LONG':
+                # Close existing LONG position
+                quantity = existing_position['quantity']
+                self.logger.info(
+                    f"Executing SELL to close LONG position for {symbol}: "
+                    f"{quantity:.8f} @ ${current_price:.2f}"
+                )
+
+                # Execute sell order
+                order = self.paper_trading_engine.execute_order(
+                    symbol=symbol,
+                    asset_class=asset_class,
+                    order_type=OrderType.MARKET,
+                    side=OrderSide.SELL,
+                    quantity=quantity,
+                    decision_id=decision_id
+                )
+
+                if order:
+                    self.logger.info(f"✅ LONG position closed: {order.order_id} - {quantity:.8f} {symbol}")
+                else:
+                    self.logger.warning(f"❌ Order execution failed for {symbol}")
+
+            elif position_size_pct > 0:
+                # Open new SHORT position
+                portfolio_value = self.paper_trading_engine.get_portfolio_value()
+                available_capital = portfolio_value.cash_balance
+
+                # Calculate order value and quantity
+                order_value = available_capital * position_size_pct
+                quantity = order_value / current_price
+
+                self.logger.info(
+                    f"Executing SELL to open SHORT position for {symbol}: "
+                    f"{quantity:.8f} @ ${current_price:.2f} = ${order_value:.2f} "
+                    f"({position_size_pct*100:.1f}% of portfolio)"
+                )
+
+                # Execute short order (sell to open)
+                order = self.paper_trading_engine.execute_order(
+                    symbol=symbol,
+                    asset_class=asset_class,
+                    order_type=OrderType.MARKET,
+                    side=OrderSide.SELL,
+                    quantity=quantity,
+                    decision_id=decision_id
+                )
+
+                if order:
+                    self.logger.info(f"✅ SHORT position opened: {order.order_id} - {quantity:.8f} {symbol}")
+                else:
+                    self.logger.warning(f"❌ Order execution failed for {symbol}")
+            else:
+                self.logger.info(f"Skipping execution - no existing position and position size is 0 for {symbol}")
+
+        except Exception as e:
+            self.logger.error(f"Error executing SELL decision for {decision.get('symbol')}: {e}", exc_info=True)
 
     def _check_system_health(self) -> Dict[str, Any]:
         """
@@ -571,7 +955,7 @@ STOP_LOSS: [0-100]%
             Dict with health status
         """
         health = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'status': 'healthy',
             'issues': []
         }
@@ -708,6 +1092,54 @@ def run_orchestrator():
 
 
 if __name__ == "__main__":
-    # Run orchestrator when executed directly
-    result = run_orchestrator()
-    print(f"Orchestration result: {result}")
+    import time
+    import signal
+    import sys
+
+    # Handle graceful shutdown
+    def signal_handler(sig, frame):
+        print("\n\nShutting down orchestrator...")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Run orchestrator continuously
+    print("Starting continuous orchestration (60 second cycles)...")
+    print("Press Ctrl+C to stop\n")
+
+    # Create orchestrator instance once to avoid Prometheus metric re-registration
+    orchestrator = OrchestratorAgent()
+
+    cycle_count = 0
+    while True:
+        try:
+            cycle_count += 1
+            print(f"\n{'='*80}")
+            print(f"CYCLE #{cycle_count} - {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            print(f"{'='*80}\n")
+
+            result = orchestrator.execute()
+
+            # Print summary
+            if result.get('success'):
+                decisions = result.get('trading_decisions', [])
+                print(f"\n✅ Cycle completed successfully")
+                print(f"   Trading decisions: {len(decisions)}")
+
+                # Show high-confidence decisions
+                high_conf = [d for d in decisions if d.get('confidence', 0) >= 0.6]
+                if high_conf:
+                    print(f"   High confidence (≥60%): {len(high_conf)}")
+                    for d in high_conf:
+                        print(f"      {d['symbol']}: {d['decision']} ({d['confidence']*100:.1f}%)")
+            else:
+                print(f"\n❌ Cycle failed: {result.get('error', 'Unknown error')}")
+
+            print(f"\n⏳ Waiting 60 seconds before next cycle...")
+            time.sleep(60)
+
+        except Exception as e:
+            print(f"\n❌ Error in orchestration cycle: {e}")
+            print(f"⏳ Waiting 60 seconds before retry...")
+            time.sleep(60)

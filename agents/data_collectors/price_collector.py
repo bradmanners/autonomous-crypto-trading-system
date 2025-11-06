@@ -4,7 +4,7 @@ Price Data Collector Agent
 Collects OHLCV price data from Binance and stores in TimescaleDB
 """
 import ccxt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
 import time
 from sqlalchemy import text
@@ -300,7 +300,7 @@ class PriceCollectorAgent(BaseAgent):
         status = {
             'exchange': 'binance',
             'pairs': {},
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
 
         for symbol in config.trading_pairs:
@@ -341,7 +341,7 @@ class PriceCollectorAgent(BaseAgent):
         )
 
         # Calculate start time
-        end_time = datetime.now()
+        end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(days=days_back)
 
         # Binance has a limit of 1000 candles per request

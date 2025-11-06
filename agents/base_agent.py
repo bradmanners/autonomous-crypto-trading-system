@@ -3,7 +3,7 @@ Base Agent Class
 All trading system agents inherit from this base class
 """
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from enum import Enum
 import logging
@@ -22,6 +22,7 @@ class AgentType(Enum):
     ORCHESTRATOR = "orchestrator"
     EXECUTOR = "executor"
     IMPROVEMENT = "improvement"
+    META = "meta"
 
 
 class SignalType(Enum):
@@ -70,7 +71,7 @@ class BaseAgent(ABC):
         self.agent_name = agent_name
         self.agent_type = agent_type
         self.version = version
-        self.start_time = datetime.now()
+        self.start_time = datetime.now(timezone.utc)
 
         # Setup logging
         self.logger = logging.getLogger(f"agent.{agent_name}")
@@ -183,7 +184,7 @@ class BaseAgent(ABC):
         self.metrics['is_running'].set(1)
         self.metrics['executions'].inc()
 
-        start_time = datetime.now()
+        start_time = datetime.now(timezone.utc)
         result = {
             'agent_name': self.agent_name,
             'start_time': start_time.isoformat(),
@@ -213,7 +214,7 @@ class BaseAgent(ABC):
             result['success'] = False
 
         finally:
-            end_time = datetime.now()
+            end_time = datetime.now(timezone.utc)
             duration = (end_time - start_time).total_seconds()
 
             result['end_time'] = end_time.isoformat()
@@ -282,7 +283,7 @@ class BaseAgent(ABC):
                     'confidence': confidence,
                     'reasoning': reasoning,
                     'metadata': json.dumps(metadata or {}),
-                    'time': datetime.now()
+                    'time': datetime.now(timezone.utc)
                 })
 
                 signal_id = result.fetchone()[0]
@@ -300,7 +301,7 @@ class BaseAgent(ABC):
                     'signal_id': signal_id,
                     'signal_type': signal_type.value,
                     'confidence': confidence,
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': datetime.now(timezone.utc).isoformat()
                 }, expiry=3600)
 
                 return signal_id
@@ -465,7 +466,7 @@ class BaseAgent(ABC):
         Returns:
             Dict with agent status information
         """
-        uptime = (datetime.now() - self.start_time).total_seconds()
+        uptime = (datetime.now(timezone.utc) - self.start_time).total_seconds()
 
         return {
             'agent_name': self.agent_name,
