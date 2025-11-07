@@ -445,11 +445,14 @@ class OrchestratorAgent(BaseAgent):
         final_confidence = sum(confidence_scores) / max(total_weight, 1)
 
         # Determine decision based on final score
-        if final_score > 50:
+        # Require higher confidence threshold (65%) to reduce noise and improve quality
+        MIN_CONFIDENCE_THRESHOLD = 0.65
+
+        if final_score > 50 and final_confidence >= MIN_CONFIDENCE_THRESHOLD:
             decision = 'BUY'
             position_size_pct = min(final_confidence * 0.3, 0.3)  # Max 30%
             stop_loss_pct = 0.05  # 5% stop loss
-        elif final_score < -50:
+        elif final_score < -50 and final_confidence >= MIN_CONFIDENCE_THRESHOLD:
             decision = 'SELL'
             position_size_pct = min(final_confidence * 0.3, 0.3)  # Max 30% for SHORT positions
             stop_loss_pct = 0.05  # 5% stop loss for SHORT
@@ -872,29 +875,76 @@ STOP_LOSS: [0-100]%
             existing_position = None
             with self.db.get_session() as session:
                 result = session.execute(text("""
-                    SELECT position_id, quantity, entry_price, side
+                    SELECT position_id, quantity, entry_price, side, opened_at
                     FROM paper_positions
                     WHERE symbol = :symbol
                     LIMIT 1
                 """), {'symbol': symbol}).fetchone()
 
                 if result:
+                    # Calculate hold duration
+                    from datetime import datetime, timezone
+                    opened_at = result[4]
+                    hold_minutes = (datetime.now(timezone.utc) - opened_at).total_seconds() / 60
+
                     existing_position = {
                         'position_id': result[0],
                         'quantity': float(result[1]),
                         'entry_price': float(result[2]),
-                        'side': result[3]
+                        'side': result[3],
+                        'hold_minutes': hold_minutes
                     }
 
             # Determine asset class (all current symbols are crypto)
             asset_class = 'crypto'
 
             if existing_position and existing_position['side'] == 'LONG':
+                # Check minimum hold time (15 minutes)
+                MIN_HOLD_TIME_MINUTES = 15
+                hold_minutes = existing_position['hold_minutes']
+
+                if hold_minutes < MIN_HOLD_TIME_MINUTES:
+                    self.logger.info(
+                        f"⏸️  Skipping SELL for {symbol} - position held for {hold_minutes:.1f}min "
+                        f"(minimum: {MIN_HOLD_TIME_MINUTES}min)"
+                    )
+                    return
+
+                # Check stop-loss and take-profit conditions
+                entry_price = existing_position['entry_price']
+                price_change_pct = ((current_price - entry_price) / entry_price) * 100
+
+                # Stop-loss: -5% (only close if losing more than 5%)
+                # Take-profit: +10% (only close if making more than 10%)
+                STOP_LOSS_PCT = -5.0
+                TAKE_PROFIT_PCT = 10.0
+
+                should_close = False
+                close_reason = ""
+
+                if price_change_pct <= STOP_LOSS_PCT:
+                    should_close = True
+                    close_reason = f"Stop-loss triggered ({price_change_pct:.2f}%)"
+                elif price_change_pct >= TAKE_PROFIT_PCT:
+                    should_close = True
+                    close_reason = f"Take-profit triggered ({price_change_pct:.2f}%)"
+                elif decision['confidence'] >= 0.75:
+                    # Only close on strong opposite signal (75%+ confidence)
+                    should_close = True
+                    close_reason = f"Strong SELL signal (confidence: {decision['confidence']:.1%})"
+
+                if not should_close:
+                    self.logger.info(
+                        f"⏸️  Holding {symbol} position - change: {price_change_pct:+.2f}%, "
+                        f"held: {hold_minutes:.1f}min, SELL confidence: {decision['confidence']:.1%}"
+                    )
+                    return
+
                 # Close existing LONG position
                 quantity = existing_position['quantity']
                 self.logger.info(
                     f"Executing SELL to close LONG position for {symbol}: "
-                    f"{quantity:.8f} @ ${current_price:.2f}"
+                    f"{quantity:.8f} @ ${current_price:.2f} | Reason: {close_reason}"
                 )
 
                 # Execute sell order
