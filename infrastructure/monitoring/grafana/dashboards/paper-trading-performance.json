@@ -100,7 +100,7 @@
             "uid": "TimescaleDB"
           },
           "format": "table",
-          "rawSql": "SELECT \n    CASE \n        WHEN status = 'HEALTHY' THEN '🟢 ' || status\n        WHEN status = 'DEGRADED' THEN '🟡 ' || status\n        ELSE '🔴 ' || status\n    END as \"Status\",\n    description as \"Description\",\n    'Orchestrator: ' || ROUND(orchestrator_age_minutes::numeric, 1) || 'm ago' as \"Orchestrator\",\n    agents_active || ' active' as \"Agents\",\n    decisions_last_hour || '/hr' as \"Decisions\",\n    signals_last_hour || '/hr' as \"Signals\"\nFROM v_system_health",
+          "rawSql": "SELECT \n    CASE \n        WHEN status = 'HEALTHY' THEN '🟢 ' || UPPER(status)\n        WHEN status = 'DEGRADED' THEN '🟡 ' || UPPER(status)\n        ELSE '🔴 ' || UPPER(status)\n    END as \"Status\",\n    CASE\n        WHEN status = 'HEALTHY' THEN '✅ All systems operational'\n        WHEN status = 'DEGRADED' THEN '⚠️ ' || description\n        ELSE '❌ ' || description\n    END as \"Status Details\",\n    'Orchestrator: ' || ROUND(orchestrator_age_minutes::numeric, 1) || 'm ago' as \"Orchestrator\",\n    agents_active || ' active' as \"Agents\",\n    decisions_last_hour || '/hr' as \"Decisions\",\n    signals_last_hour || '/hr' as \"Signals\"\nFROM v_system_health",
           "refId": "A"
         }
       ],
